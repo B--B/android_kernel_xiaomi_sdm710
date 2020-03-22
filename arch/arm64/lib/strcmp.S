@@ -65,6 +65,7 @@
 
 
 ENTRY(strcmp)
+.p2align 6
 	sub	off2, src2, src1
 	mov	zeroones, REP8_01
 	and	tmp, src1, 7
