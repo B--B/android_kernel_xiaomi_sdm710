@@ -783,6 +783,9 @@ static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 
 void activate_task(struct rq *rq, struct task_struct *p, int flags)
 {
+	if (task_on_rq_migrating(p))
+		flags |= ENQUEUE_MIGRATED;
+
 	if (task_contributes_to_load(p))
 		rq->nr_uninterruptible--;
 
@@ -1119,10 +1122,32 @@ void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_ma
 	p->nr_cpus_allowed = cpumask_weight(new_mask);
 }
 
+static const struct cpumask *
+get_adjusted_cpumask(const struct task_struct *p,
+		     const struct cpumask *orig_mask)
+{
+	/* Force all low-power kthreads onto the little cluster */
+	if (p->flags & PF_LOW_POWER)
+		return cpu_lp_mask;
+
+	/* Force all performance-critical kthreads onto the big cluster */
+	if (p->flags & PF_PERF_CRITICAL)
+		return cpu_perf_mask;
+
+	/* Force all trivial, unbound kthreads onto the little cluster */
+	if (p->flags & PF_KTHREAD && p->pid != 1 &&
+		cpumask_equal(orig_mask, cpu_all_mask))
+		return cpu_lp_mask;
+
+	return orig_mask;
+}
+
 void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
 {
 	struct rq *rq = task_rq(p);
 	bool queued, running;
+
+	new_mask = get_adjusted_cpumask(p, new_mask);
 
 	lockdep_assert_held(&p->pi_lock);
 
@@ -1167,9 +1192,7 @@ static int __set_cpus_allowed_ptr(struct task_struct *p,
 	int ret = 0;
 	cpumask_t allowed_mask;
 
-	/* Force all performance-critical kthreads onto the big cluster */
-	if (p->flags & PF_PERF_CRITICAL)
-		new_mask = cpu_perf_mask;
+	new_mask = get_adjusted_cpumask(p, new_mask);
 
 	rq = task_rq_lock(p, &rf);
 	update_rq_clock(rq);
@@ -5150,14 +5173,14 @@ SYSCALL_DEFINE3(sched_getaffinity, pid_t, pid, unsigned int, len,
 	if (len & (sizeof(unsigned long)-1))
 		return -EINVAL;
 
-	if (!alloc_cpumask_var(&mask, GFP_KERNEL))
+	if (!zalloc_cpumask_var(&mask, GFP_KERNEL))
 		return -ENOMEM;
 
 	ret = sched_getaffinity(pid, mask);
 	if (ret == 0) {
 		size_t retlen = min_t(size_t, len, cpumask_size());
 
-		if (copy_to_user(user_mask_ptr, mask, retlen))
+		if (copy_to_user(user_mask_ptr, cpumask_bits(mask), retlen))
 			ret = -EFAULT;
 		else
 			ret = retlen;
@@ -6490,10 +6513,10 @@ static int init_rootdomain(struct root_domain *rd)
 
 	init_dl_bw(&rd->dl_bw);
 	if (cpudl_init(&rd->cpudl) != 0)
-		goto free_dlo_mask;
+		goto free_rto_mask;
 
 	if (cpupri_init(&rd->cpupri) != 0)
-		goto free_rto_mask;
+		goto free_cpudl;
 
 	init_max_cpu_capacity(&rd->max_cpu_capacity);
 
@@ -6501,6 +6524,8 @@ static int init_rootdomain(struct root_domain *rd)
 
 	return 0;
 
+free_cpudl:
+	cpudl_cleanup(&rd->cpudl);
 free_rto_mask:
 	free_cpumask_var(rd->rto_mask);
 free_dlo_mask:
@@ -9701,7 +9726,6 @@ void sched_exit(struct task_struct *p)
 	enqueue_task(rq, p, 0);
 	clear_ed_task(p, rq);
 	task_rq_unlock(rq, p, &rf);
-	free_task_load_ptrs(p);
 }
 #endif /* CONFIG_SCHED_WALT */
 
